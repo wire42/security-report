@@ -1,5 +1,10 @@
 Windows Security Report PowerShell Script
+
+
+
 This PowerShell script collects and reports on key Windows security events from multiple servers. It gathers failed and successful logins, account management events, privileged activity, policy changes, object access, system events, and PowerShell execution logs. The script also enriches external IP addresses with geolocation data and emails a comprehensive HTML report.
+
+
 
 Features
 Multi-Server Support: Query any number of Windows servers remotely.
@@ -14,6 +19,8 @@ Detailed Reporting: Generates a well-structured HTML report and sends it via ema
 
 Customizable: Easily adjust event categories, servers, and output.
 
+
+
 Prerequisites
 PowerShell 5.1 or later
 
@@ -22,6 +29,7 @@ Permissions to read Security and PowerShell logs on all target servers
 Outbound internet access for IP geolocation lookups (to ip-api.com)
 
 SMTP server details for email delivery
+
 
 Configuration
 Edit Server List:
