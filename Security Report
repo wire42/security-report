@@ -1,0 +1,73 @@
+# Define servers to query
+$servers = @("Server1", "Server2")
+
+# Define event IDs for each category
+$eventCategories = @{
+    "FailedLogons"            = 4625
+    "SuccessfulLogons"        = 4624
+    "AccountLockouts"         = 4740
+    "AccountCreated"          = 4720
+    "AccountDeleted"          = 4726
+    "PasswordResets"          = 4723,4724,4725
+    "PrivilegedLogons"        = 4672
+    "GroupMembershipChanges"  = 4732,4733,4728,4729
+    "PolicyChanges"           = 4739,4719
+    "SensitiveObjectAccess"   = 4663
+    "SystemEvents"            = 6005,6006,6008,1074
+    "PowerShellExecution"     = 4104
+}
+
+# Store all results
+$allResults = @()
+
+foreach ($server in $servers) {
+    Write-Host "Processing $server..."
+
+    foreach ($category in $eventCategories.Keys) {
+        $eventIDs = $eventCategories[$category]
+        $events = Get-WinEvent -ComputerName $server -FilterHashtable @{
+            LogName = if ($category -eq "PowerShellExecution") { "Microsoft-Windows-PowerShell/Operational" } else { "Security" }
+            Id      = $eventIDs
+            StartTime = (Get-Date).AddDays(-1)
+        } -ErrorAction SilentlyContinue
+
+        foreach ($event in $events) {
+            $xml = [xml]$event.ToXml()
+            $data = @{
+                Server   = $server
+                Category = $category
+                Time     = $event.TimeCreated
+                EventID  = $event.Id
+                User     = $xml.Event.EventData.Data | Where-Object { $_.Name -eq "TargetUserName" } | Select-Object -ExpandProperty "#text"
+                IP       = $xml.Event.EventData.Data | Where-Object { $_.Name -eq "IpAddress" } | Select-Object -ExpandProperty "#text"
+                Workstation = $xml.Event.EventData.Data | Where-Object { $_.Name -eq "WorkstationName" } | Select-Object -ExpandProperty "#text"
+                Reason   = $xml.Event.EventData.Data | Where-Object { $_.Name -eq "FailureReason" } | Select-Object -ExpandProperty "#text"
+                Details  = ($xml.Event.EventData.Data | ForEach-Object { "$($_.Name): $($_.'#text')" }) -join "; "
+            }
+            $allResults += New-Object PSObject -Property $data
+        }
+    }
+}
+
+# Calculate time between related events (example for failed logons per user)
+$failedLogons = $allResults | Where-Object { $_.Category -eq "FailedLogons" } | Sort-Object User, Time
+$failedLogons | Group-Object User | ForEach-Object {
+    $prevTime = $null
+    foreach ($entry in $_.Group) {
+        if ($prevTime) {
+            $entry | Add-Member -MemberType NoteProperty -Name "TimeSinceLastAttempt" -Value ($entry.Time - $prevTime)
+        } else {
+            $entry | Add-Member -MemberType NoteProperty -Name "TimeSinceLastAttempt" -Value "N/A"
+        }
+        $prevTime = $entry.Time
+    }
+}
+
+# Combine all results (add time between attempts for failed logons)
+$reportResults = $allResults
+
+# Export to HTML for email
+$htmlReport = $reportResults | Sort-Object Time | ConvertTo-Html -Property Server,Category,Time,User,IP,Workstation,Reason,Details,TimeSinceLastAttempt -Title "Security Report" | Out-String
+
+# Send email (edit SMTP details as needed)
+Send-MailMessage -From "security@yourdomain.com" -To "admin@yourdomain.com" -Subject "Windows Security Report" -Body $htmlReport -BodyAsHtml -SmtpServer "smtp.yourdomain.com"
