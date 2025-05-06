@@ -1,5 +1,5 @@
 # Define servers to query
-$servers = @("Server1", "Server2")
+$servers = @("Server1", "Server2") # <-- Replace with your server names
 
 # Define event IDs for each category
 $eventCategories = @{
@@ -17,6 +17,53 @@ $eventCategories = @{
     "PowerShellExecution"     = 4104
 }
 
+# Function to check if IP is public
+function Is-PublicIP {
+    param([string]$IPAddress)
+    if ($IPAddress -match '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)') { return $false }
+    if ($IPAddress -match '^127\.') { return $false }
+    if ($IPAddress -match '^::1$') { return $false }
+    return $true
+}
+
+# Function to get geolocation info for an IP
+function Get-IPGeolocation {
+    param([string]$IPAddress)
+    if (-not (Is-PublicIP $IPAddress)) {
+        return [PSCustomObject]@{
+            City    = "Internal"
+            Region  = ""
+            Country = ""
+            ISP     = ""
+        }
+    }
+    try {
+        $geo = Invoke-RestMethod -Uri "http://ip-api.com/json/$IPAddress" -TimeoutSec 5
+        if ($geo.status -eq "success") {
+            return [PSCustomObject]@{
+                City    = $geo.city
+                Region  = $geo.regionName
+                Country = $geo.country
+                ISP     = $geo.isp
+            }
+        } else {
+            return [PSCustomObject]@{
+                City    = "Unknown"
+                Region  = ""
+                Country = ""
+                ISP     = ""
+            }
+        }
+    } catch {
+        return [PSCustomObject]@{
+            City    = "Error"
+            Region  = ""
+            Country = ""
+            ISP     = ""
+        }
+    }
+}
+
 # Store all results
 $allResults = @()
 
@@ -25,31 +72,55 @@ foreach ($server in $servers) {
 
     foreach ($category in $eventCategories.Keys) {
         $eventIDs = $eventCategories[$category]
-        $events = Get-WinEvent -ComputerName $server -FilterHashtable @{
-            LogName = if ($category -eq "PowerShellExecution") { "Microsoft-Windows-PowerShell/Operational" } else { "Security" }
-            Id      = $eventIDs
-            StartTime = (Get-Date).AddDays(-1)
-        } -ErrorAction SilentlyContinue
+        $logName = if ($category -eq "PowerShellExecution") { "Microsoft-Windows-PowerShell/Operational" } else { "Security" }
+        try {
+            $events = Get-WinEvent -ComputerName $server -FilterHashtable @{
+                LogName   = $logName
+                Id        = $eventIDs
+                StartTime = (Get-Date).AddDays(-1)
+            } -ErrorAction Stop
+        } catch {
+            Write-Warning "Failed to get events from $server ($category): $_"
+            continue
+        }
 
         foreach ($event in $events) {
             $xml = [xml]$event.ToXml()
-            $data = @{
-                Server   = $server
-                Category = $category
-                Time     = $event.TimeCreated
-                EventID  = $event.Id
-                User     = $xml.Event.EventData.Data | Where-Object { $_.Name -eq "TargetUserName" } | Select-Object -ExpandProperty "#text"
-                IP       = $xml.Event.EventData.Data | Where-Object { $_.Name -eq "IpAddress" } | Select-Object -ExpandProperty "#text"
-                Workstation = $xml.Event.EventData.Data | Where-Object { $_.Name -eq "WorkstationName" } | Select-Object -ExpandProperty "#text"
-                Reason   = $xml.Event.EventData.Data | Where-Object { $_.Name -eq "FailureReason" } | Select-Object -ExpandProperty "#text"
-                Details  = ($xml.Event.EventData.Data | ForEach-Object { "$($_.Name): $($_.'#text')" }) -join "; "
+            $user = $xml.Event.EventData.Data | Where-Object { $_.Name -eq "TargetUserName" } | Select-Object -ExpandProperty "#text" -ErrorAction SilentlyContinue
+            $ip = $xml.Event.EventData.Data | Where-Object { $_.Name -eq "IpAddress" } | Select-Object -ExpandProperty "#text" -ErrorAction SilentlyContinue
+            $workstation = $xml.Event.EventData.Data | Where-Object { $_.Name -eq "WorkstationName" } | Select-Object -ExpandProperty "#text" -ErrorAction SilentlyContinue
+            $reason = $xml.Event.EventData.Data | Where-Object { $_.Name -eq "FailureReason" } | Select-Object -ExpandProperty "#text" -ErrorAction SilentlyContinue
+            $details = ($xml.Event.EventData.Data | ForEach-Object { "$($_.Name): $($_.'#text')" }) -join "; "
+
+            # Only geolocate if IP is present and not empty
+            $geoInfo = @{}
+            if ($ip -and $ip -notin @("::1","127.0.0.1","-","")) {
+                $geoInfo = Get-IPGeolocation $ip
+                Start-Sleep -Milliseconds 1500  # To avoid hitting API rate limits (45 req/min)
+            } else {
+                $geoInfo = [PSCustomObject]@{City="N/A";Region="";Country="";ISP=""}
             }
-            $allResults += New-Object PSObject -Property $data
+
+            $allResults += [PSCustomObject]@{
+                Server      = $server
+                Category    = $category
+                Time        = $event.TimeCreated
+                EventID     = $event.Id
+                User        = $user
+                IP          = $ip
+                City        = $geoInfo.City
+                Region      = $geoInfo.Region
+                Country     = $geoInfo.Country
+                ISP         = $geoInfo.ISP
+                Workstation = $workstation
+                Reason      = $reason
+                Details     = $details
+            }
         }
     }
 }
 
-# Calculate time between related events (example for failed logons per user)
+# Calculate time between failed login attempts per user
 $failedLogons = $allResults | Where-Object { $_.Category -eq "FailedLogons" } | Sort-Object User, Time
 $failedLogons | Group-Object User | ForEach-Object {
     $prevTime = $null
@@ -63,11 +134,28 @@ $failedLogons | Group-Object User | ForEach-Object {
     }
 }
 
-# Combine all results (add time between attempts for failed logons)
-$reportResults = $allResults
+# Merge TimeSinceLastAttempt back into main results
+foreach ($entry in $failedLogons) {
+    $match = $allResults | Where-Object { $_.Category -eq "FailedLogons" -and $_.User -eq $entry.User -and $_.Time -eq $entry.Time }
+    if ($match) {
+        $match | Add-Member -MemberType NoteProperty -Name "TimeSinceLastAttempt" -Value $entry.TimeSinceLastAttempt -Force
+    }
+}
 
-# Export to HTML for email
-$htmlReport = $reportResults | Sort-Object Time | ConvertTo-Html -Property Server,Category,Time,User,IP,Workstation,Reason,Details,TimeSinceLastAttempt -Title "Security Report" | Out-String
+# Fill in TimeSinceLastAttempt for other events as N/A
+$allResults | Where-Object { $_.Category -ne "FailedLogons" } | ForEach-Object {
+    $_ | Add-Member -MemberType NoteProperty -Name "TimeSinceLastAttempt" -Value "N/A" -Force
+}
 
-# Send email (edit SMTP details as needed)
-Send-MailMessage -From "security@yourdomain.com" -To "admin@yourdomain.com" -Subject "Windows Security Report" -Body $htmlReport -BodyAsHtml -SmtpServer "smtp.yourdomain.com"
+# Format to HTML
+$htmlReport = $allResults | Sort-Object Time | Select-Object Server,Category,Time,User,IP,City,Region,Country,ISP,Workstation,Reason,TimeSinceLastAttempt,Details |
+    ConvertTo-Html -Title "Windows Security Report" |
+    Out-String
+
+# Email the report (edit SMTP details as needed)
+Send-MailMessage -From "security@yourdomain.com" `
+                 -To "admin@yourdomain.com" `
+                 -Subject "Windows Security Report" `
+                 -Body $htmlReport `
+                 -BodyAsHtml `
+                 -SmtpServer "smtp.yourdomain.com"
